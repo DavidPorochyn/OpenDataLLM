@@ -64,9 +64,59 @@ def node_execute_tool(state: AgentState) -> AgentState:
     elif fmt == "CSV":
         analysis_result = analyze_csv(url, user_query)
     elif fmt in {"GEOJSON", "WFS", "JSON"}:
-        # Provide a generic sample query; the LLM will interpret the preview.
-        sql_query = f"SELECT * FROM geo LIMIT 500"
-        analysis_result = query_geospatial(url, sql_query)
+        # Step 1: get a small preview + schema so the LLM can see columns and sample rows.
+        preview_sql = "SELECT * FROM geo LIMIT 200"
+        preview_result = query_geospatial(url, preview_sql)
+
+        # If loading the dataset failed, surface the error as-is.
+        if preview_result.get("error"):
+            analysis_result = preview_result
+        else:
+            # Step 2: ask the LLM to generate a focused DuckDB SQL query over `geo`.
+            #
+            # We give it:
+            # - the user question
+            # - the column names
+            # - a small markdown preview
+            # and instruct it to return ONLY a valid SQL query.
+            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
+            system_msg = AIMessage(
+                content=(
+                    "You are a data analyst writing DuckDB SQL over a single table "
+                    "named `geo` that comes from a geospatial dataset.\n"
+                    "- Use the available columns only.\n"
+                    "- When the question involves locations or distances, you may use "
+                    "DuckDB spatial functions such as ST_Distance, ST_Within, "
+                    "and ST_Point where appropriate.\n"
+                    "- If an aggregate (COUNT, AVG, etc.) answers the question well, "
+                    "prefer that over returning many raw rows.\n"
+                    "- Always return a single SQL query that DuckDB can execute, and "
+                    "nothing else (no explanations or comments)."
+                )
+            )
+
+            columns = preview_result.get("columns", [])
+            preview_md = preview_result.get("preview_markdown", "")
+            user_msg = HumanMessage(
+                content=(
+                    f"User question:\n{user_query}\n\n"
+                    f"Available columns in table `geo`:\n{columns}\n\n"
+                    f"Sample rows (markdown table):\n{preview_md}\n\n"
+                    "Write a DuckDB SQL query over the table `geo` that best answers "
+                    "the user question, using only the available columns. "
+                    "Return ONLY the SQL query."
+                )
+            )
+
+            sql_resp = llm.invoke([system_msg, user_msg])
+            sql_query = (sql_resp.content or "").strip()
+
+            # Very lightweight safety: fall back to a generic preview if the
+            # model did not actually return a SELECT over `geo`.
+            if "select" not in sql_query.lower() or " from geo" not in sql_query.lower():
+                sql_query = "SELECT * FROM geo LIMIT 500"
+
+            analysis_result = query_geospatial(url, sql_query)
     else:
         analysis_result = {
             "error": "unsupported_format",
