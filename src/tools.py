@@ -104,11 +104,83 @@ def analyze_csv(url: str, user_query: str) -> Dict[str, Any]:
 
 def _init_duckdb_spatial(conn: duckdb.DuckDBPyConnection) -> None:
     """
-    Ensure DuckDB spatial extension is installed and loaded.
+    Ensure DuckDB spatial + HTTPFS extensions are installed and loaded.
     """
+    conn.execute("SET allow_unsigned_extensions=true;")
+    duckdb.install_extension("httpfs")
+    duckdb.load_extension("httpfs")
     duckdb.install_extension("spatial")
     duckdb.load_extension("spatial")
+
+
+def _init_duckdb_httpfs(conn: duckdb.DuckDBPyConnection) -> None:
+    """
+    Ensure DuckDB HTTPFS extension is installed and loaded for remote files.
+    """
     conn.execute("SET allow_unsigned_extensions=true;")
+    duckdb.install_extension("httpfs")
+    duckdb.load_extension("httpfs")
+
+
+def query_tabular(url: str, sql_query: str) -> Dict[str, Any]:
+    """
+    Execute a SQL query against a remote CSV (or similar tabular file) using DuckDB.
+
+    Convention:
+    - The caller should refer to the data as the table/view `tab`.
+    - This function downloads the CSV with pandas (more robust for HTTP) and registers
+      it with DuckDB, then runs the SQL query.
+    """
+    conn = duckdb.connect()
+    try:
+        # Use pandas to download CSV (handles HTTP/HTTPS, redirects, SSL better than DuckDB)
+        try:
+            df = pd.read_csv(url)
+        except Exception as download_exc:
+            return {
+                "kind": "tabular",
+                "url": url,
+                "sql_query": sql_query,
+                "error": "download_failed",
+                "error_message": (
+                    f"I found the dataset, but could not download the CSV file from the URL. "
+                    f"This might be due to network issues, authentication requirements, or a broken link."
+                ),
+                "exception": repr(download_exc),
+            }
+
+        # Register the pandas DataFrame with DuckDB as table 'tab'
+        conn.register("tab", df)
+
+        # Execute the SQL query
+        result_df = conn.execute(sql_query).fetch_df()
+    except Exception as exc:
+        return {
+            "kind": "tabular",
+            "url": url,
+            "sql_query": sql_query,
+            "error": "query_failed",
+            "error_message": (
+                f"I downloaded the CSV file, but the SQL query could not be executed. "
+                f"This might be due to invalid SQL syntax, missing columns, or data type issues."
+            ),
+            "exception": repr(exc),
+        }
+    finally:
+        conn.close()
+
+    preview = result_df.head(200)
+
+    result: Dict[str, Any] = {
+        "kind": "tabular",
+        "url": url,
+        "sql_query": sql_query,
+        "preview_markdown": preview.to_markdown(index=False),
+        "columns": list(preview.columns),
+        "row_count": len(result_df),
+    }
+
+    return result
 
 
 def query_geospatial(url: str, sql_query: str) -> Dict[str, Any]:

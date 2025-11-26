@@ -7,7 +7,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 
-from .tools import analyze_csv, find_dataset, query_geospatial
+from .tools import analyze_csv, find_dataset, query_geospatial, query_tabular
 
 
 class AgentState(TypedDict):
@@ -62,7 +62,70 @@ def node_execute_tool(state: AgentState) -> AgentState:
             "error_message": "I found a dataset, but it has no usable file URL.",
         }
     elif fmt == "CSV":
-        analysis_result = analyze_csv(url, user_query)
+        # Step 1: get a small preview + schema so the LLM can see columns and sample rows.
+        preview_sql = "SELECT * FROM tab LIMIT 200"
+        preview_result = query_tabular(url, preview_sql)
+
+        if preview_result.get("error"):
+            analysis_result = preview_result
+        else:
+            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
+            system_msg = AIMessage(
+                content=(
+                    "You are a data analyst writing DuckDB SQL over a single table "
+                    "named `tab` that comes from a CSV dataset.\n"
+                    "- Use ONLY the available columns.\n"
+                    "- Your query MUST be a single SELECT statement over `tab`.\n"
+                    "- You MAY use WHERE, GROUP BY, ORDER BY, and LIMIT clauses.\n"
+                    "- You MUST NOT use JOINs, subqueries, CTEs (WITH), or modify data.\n"
+                    "- If an aggregate (COUNT, AVG, etc.) answers the question well, "
+                    "prefer that over returning many raw rows.\n"
+                    "- Return only the SQL query, with no explanations or comments."
+                )
+            )
+
+            columns = preview_result.get("columns", [])
+            preview_md = preview_result.get("preview_markdown", "")
+            user_msg = HumanMessage(
+                content=(
+                    f"User question:\n{user_query}\n\n"
+                    f"Available columns in table `tab`:\n{columns}\n\n"
+                    f"Sample rows (markdown table):\n{preview_md}\n\n"
+                    "Write a DuckDB SQL query over the table `tab` that best answers "
+                    "the user question, using only the available columns. "
+                    "The query must have the form:\n"
+                    "SELECT <columns or expressions>\n"
+                    "FROM tab\n"
+                    "[WHERE ...]\n"
+                    "[GROUP BY ...]\n"
+                    "[ORDER BY ...]\n"
+                    "[LIMIT ...]\n"
+                    "Return ONLY this SQL query."
+                )
+            )
+
+            sql_resp = llm.invoke([system_msg, user_msg])
+            sql_query = (sql_resp.content or "").strip()
+
+            # Very lightweight safety: enforce a simple SELECT on `tab`.
+            lower_sql = sql_query.lower()
+            if (
+                "select" not in lower_sql
+                or " from tab" not in lower_sql
+                or any(bad in lower_sql for bad in [" join ", " with ", ";", " insert ", " update ", " delete ", " create ", " drop ", " alter "])
+            ):
+                sql_query = "SELECT * FROM tab LIMIT 500"
+
+            analysis_result = query_tabular(url, sql_query)
+
+            # Fallback: if the focused SQL query fails, fall back to a safe preview.
+            if analysis_result.get("error") == "query_failed":
+                fallback_sql = "SELECT * FROM tab LIMIT 200"
+                fallback_result = query_tabular(url, fallback_sql)
+                # Attach some context about the failed query for the final LLM.
+                fallback_result["note"] = "focused_sql_failed"
+                fallback_result["failed_sql"] = sql_query
+                analysis_result = fallback_result
     elif fmt in {"GEOJSON", "WFS", "JSON"}:
         # Step 1: get a small preview + schema so the LLM can see columns and sample rows.
         preview_sql = "SELECT * FROM geo LIMIT 200"
@@ -73,25 +136,21 @@ def node_execute_tool(state: AgentState) -> AgentState:
             analysis_result = preview_result
         else:
             # Step 2: ask the LLM to generate a focused DuckDB SQL query over `geo`.
-            #
-            # We give it:
-            # - the user question
-            # - the column names
-            # - a small markdown preview
-            # and instruct it to return ONLY a valid SQL query.
             llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
             system_msg = AIMessage(
                 content=(
                     "You are a data analyst writing DuckDB SQL over a single table "
                     "named `geo` that comes from a geospatial dataset.\n"
-                    "- Use the available columns only.\n"
+                    "- Use ONLY the available columns.\n"
+                    "- Your query MUST be a single SELECT statement over `geo`.\n"
+                    "- You MAY use WHERE, GROUP BY, ORDER BY, and LIMIT clauses.\n"
+                    "- You MUST NOT use JOINs, subqueries, CTEs (WITH), or modify data.\n"
                     "- When the question involves locations or distances, you may use "
                     "DuckDB spatial functions such as ST_Distance, ST_Within, "
                     "and ST_Point where appropriate.\n"
                     "- If an aggregate (COUNT, AVG, etc.) answers the question well, "
                     "prefer that over returning many raw rows.\n"
-                    "- Always return a single SQL query that DuckDB can execute, and "
-                    "nothing else (no explanations or comments)."
+                    "- Return only the SQL query, with no explanations or comments."
                 )
             )
 
@@ -104,19 +163,38 @@ def node_execute_tool(state: AgentState) -> AgentState:
                     f"Sample rows (markdown table):\n{preview_md}\n\n"
                     "Write a DuckDB SQL query over the table `geo` that best answers "
                     "the user question, using only the available columns. "
-                    "Return ONLY the SQL query."
+                    "The query must have the form:\n"
+                    "SELECT <columns or expressions>\n"
+                    "FROM geo\n"
+                    "[WHERE ...]\n"
+                    "[GROUP BY ...]\n"
+                    "[ORDER BY ...]\n"
+                    "[LIMIT ...]\n"
+                    "Return ONLY this SQL query."
                 )
             )
 
             sql_resp = llm.invoke([system_msg, user_msg])
             sql_query = (sql_resp.content or "").strip()
 
-            # Very lightweight safety: fall back to a generic preview if the
-            # model did not actually return a SELECT over `geo`.
-            if "select" not in sql_query.lower() or " from geo" not in sql_query.lower():
+            # Very lightweight safety: enforce a simple SELECT on `geo`.
+            lower_sql = sql_query.lower()
+            if (
+                "select" not in lower_sql
+                or " from geo" not in lower_sql
+                or any(bad in lower_sql for bad in [" join ", " with ", ";", " insert ", " update ", " delete ", " create ", " drop ", " alter "])
+            ):
                 sql_query = "SELECT * FROM geo LIMIT 500"
 
             analysis_result = query_geospatial(url, sql_query)
+
+            # Fallback: if the focused SQL query fails, fall back to a safe preview.
+            if analysis_result.get("error") == "query_failed":
+                fallback_sql = "SELECT * FROM geo LIMIT 200"
+                fallback_result = query_geospatial(url, fallback_sql)
+                fallback_result["note"] = "focused_sql_failed"
+                fallback_result["failed_sql"] = sql_query
+                analysis_result = fallback_result
     else:
         analysis_result = {
             "error": "unsupported_format",
@@ -177,18 +255,27 @@ def node_generate_answer(state: AgentState) -> AgentState:
     analysis_text = "No analysis result."
     if analysis:
         if analysis.get("error"):
+            error_type = analysis.get("error", "unknown_error")
+            error_msg = analysis.get("error_message", "An error occurred")
+            exception = analysis.get("exception", "")
+            sql_query = analysis.get("sql_query", "")
+            
             analysis_text = (
-                f"Tool reported an error: {analysis.get('error')}\n"
-                f"Error message: {analysis.get('error_message')}\n"
-                f"Exception (if any): {analysis.get('exception')}\n"
+                f"Tool reported an error: {error_type}\n"
+                f"Error message: {error_msg}\n"
             )
+            if sql_query:
+                analysis_text += f"SQL query that failed: {sql_query}\n"
+            if exception:
+                analysis_text += f"Technical details: {exception}\n"
         else:
-            if analysis.get("kind") == "csv":
+            kind = analysis.get("kind")
+            if kind in {"csv", "tabular"}:
                 analysis_text = (
-                    "CSV analysis preview (markdown table):\n"
+                    "Tabular analysis preview (markdown table):\n"
                     f"{analysis.get('preview_markdown')}\n"
                 )
-            elif analysis.get("kind") == "geospatial":
+            elif kind == "geospatial":
                 analysis_text = (
                     "Geospatial query preview (markdown table):\n"
                     f"{analysis.get('preview_markdown')}\n"
