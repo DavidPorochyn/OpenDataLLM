@@ -40,7 +40,33 @@ You can optionally limit the number of packages ingested for testing by editing 
 ingest_catalog(max_packages=200)
 ```
 
-5. **Launch the Streamlit UI**:
+5. **Launch the application**:
+
+**Option A: FastAPI API (Recommended for programmatic access)**
+
+```bash
+python api.py
+```
+
+Or using uvicorn directly:
+
+```bash
+uvicorn api:app --host 0.0.0.0 --port 8000
+```
+
+The API will be available at `http://localhost:8000`. You can:
+- View API documentation at `http://localhost:8000/docs` (Swagger UI)
+- Query the agent via POST requests to `http://localhost:8000/query`
+
+Example query:
+
+```bash
+curl -X POST "http://localhost:8000/query" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "How many bike parking spots are in Schwabing?"}'
+```
+
+**Option B: Streamlit UI (For interactive web interface)**
 
 ```bash
 streamlit run app.py

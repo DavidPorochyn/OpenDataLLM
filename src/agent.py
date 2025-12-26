@@ -7,7 +7,12 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 
-from .tools import analyze_csv, find_dataset, query_geospatial, query_tabular
+from .tools import (
+    analyze_csv,
+    find_dataset,
+    query_geospatial,
+    query_tabular,
+)
 
 
 class AgentState(TypedDict):
@@ -212,7 +217,7 @@ def node_execute_tool(state: AgentState) -> AgentState:
 def _build_system_prompt() -> str:
     return (
         "You are a data analyst working with the City of Munich Open Data Portal.\n"
-        "You MUST NOT hallucinate datasets or values. If the data you see does not\n"
+        "You MUST NOT hallucinate datasets or values from the provided dataset. If the data you see does not\n"
         "contain enough information to answer the question, say so explicitly and\n"
         "suggest what data would be needed.\n\n"
         "You receive:\n"
@@ -220,7 +225,9 @@ def _build_system_prompt() -> str:
         "- The chosen dataset metadata (title, description, resources).\n"
         "- A preview of the relevant file (CSV or geospatial) as a markdown table.\n\n"
         "Instructions:\n"
-        "- Use ONLY the data you see in the preview and metadata.\n"
+        "- Use ONLY the data you see in the preview and metadata for dataset values and facts.\n"
+        "- You MAY use general geographical knowledge about Munich (districts, neighborhoods, landmarks, locations) "
+        "to provide context and help answer questions about locations or areas mentioned in the data.\n"
         "- If the analysis_result has an 'error', clearly explain the issue.\n"
         "- When the preview includes latitude/longitude coordinates, you may refer to\n"
         "  the existence of points on a map, but do not fabricate extra points.\n"
@@ -253,6 +260,7 @@ def node_generate_answer(state: AgentState) -> AgentState:
             )
 
     analysis_text = "No analysis result."
+    
     if analysis:
         if analysis.get("error"):
             error_type = analysis.get("error", "unknown_error")
@@ -280,6 +288,9 @@ def node_generate_answer(state: AgentState) -> AgentState:
                     "Geospatial query preview (markdown table):\n"
                     f"{analysis.get('preview_markdown')}\n"
                 )
+            
+            # Note: Coordinate checking against districts is disabled to prevent crashes
+            # The Stadtbezirke dataset is available for the LLM to reference in its analysis
 
     messages: List[BaseMessage] = [
         AIMessage(content=system_prompt),
