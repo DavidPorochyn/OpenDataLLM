@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import BaseModel
+from starlette.middleware.cors import CORSMiddleware
 
 from src.agent import AgentState, build_graph
 
@@ -23,6 +24,14 @@ app = FastAPI(
     description="Ask questions about datasets from the Munich Open Data portal. "
     "The agent finds a relevant dataset and analyzes it without hallucinating.",
     version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins (change to ["http://localhost:3000"] for production)
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods (GET, POST, OPTIONS, etc.)
+    allow_headers=["*"],  # Allows all headers
 )
 
 
